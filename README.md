@@ -114,6 +114,10 @@ cd claude-vault
 git clone https://github.com/kuroko1t/claude-vault.git
 cd claude-vault
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+
+# Windows without WSL: builds the Turso CLI natively with Go, uses it just
+# for login and API-token minting, and provisions over the Platform REST API
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -NoWsl
 ```
 
 The scripts are idempotent (every step checks before it acts), so they're safe
@@ -275,7 +279,8 @@ auto-archive hooks:
 ```
 
 ```powershell
-# Windows
+# Windows (add -NoWsl to provision without WSL, via a Go-built Turso CLI
+# and the Platform REST API)
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 ```
 
@@ -292,8 +297,10 @@ curl -sSfL https://get.tur.so/install.sh | bash
 # Linux
 curl -sSfL https://get.tur.so/install.sh | bash
 
-# Windows: no native support — run the same script inside WSL
+# Windows: no official native binaries — run the same script inside WSL,
 wsl -e sh -c 'curl -sSfL https://get.tur.so/install.sh | bash'
+# or build the CLI natively with Go
+go install github.com/tursodatabase/turso-cli/cmd/turso@latest
 ```
 
 Then create an account (or log in — same command either way; it opens a
