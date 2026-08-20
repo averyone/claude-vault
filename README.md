@@ -95,6 +95,22 @@ cargo install claude-vault
 cargo install --path .
 ```
 
+### macOS one-shot installer (with multi-device sync)
+
+If you want the full setup — toolchain, Turso CLI and database, environment
+variables, build, initial import, and Claude Code auto-archive hooks — run the
+bundled installer instead of the manual steps:
+
+```bash
+git clone https://github.com/kuroko1t/claude-vault.git
+cd claude-vault
+./scripts/install-mac.sh
+```
+
+The script is idempotent (every step checks before it acts), so it's safe to
+re-run after a failure or to repair a partial setup. See
+[Multi-device sync](#multi-device-sync) for what it configures.
+
 ## Quick Start
 
 1. Import all existing conversations from `~/.claude/projects/`:
@@ -237,6 +253,42 @@ Share one vault across machines using [libSQL embedded replicas](https://docs.tu
 
 > **Why not just put `vault.db` in iCloud/Dropbox?** File-sync services don't participate in SQLite's locking and sync the WAL files independently, which corrupts the database. Embedded replicas exist to solve exactly this.
 
+### Quick setup (macOS)
+
+The bundled installer does everything in this section for you — installs the
+toolchain and Turso CLI, creates the database, sets the environment variables,
+builds claude-vault, imports your history, and wires up the Claude Code
+auto-archive hooks:
+
+```bash
+./scripts/install-mac.sh
+```
+
+Run it on each Mac you want connected to the same vault. It's idempotent, so
+re-running is always safe. The manual equivalent follows.
+
+### Installing the Turso CLI
+
+```bash
+# macOS (either works)
+brew install tursodatabase/tap/turso
+curl -sSfL https://get.tur.so/install.sh | bash
+
+# Linux
+curl -sSfL https://get.tur.so/install.sh | bash
+```
+
+Then create an account (or log in — same command either way; it opens a
+browser):
+
+```bash
+turso auth signup
+```
+
+Turso's free tier is more than enough for conversation archives. Note that the
+hosted service holds a copy of your conversation history; if that's a concern,
+self-host sqld instead (see below).
+
 ### Setup with Turso
 
 ```bash
@@ -249,6 +301,9 @@ turso db tokens create claude-vault     # -> auth token
 export CLAUDE_VAULT_SYNC_URL="libsql://claude-vault-<org>.turso.io"
 export CLAUDE_VAULT_AUTH_TOKEN="<token>"
 ```
+
+Tokens don't expire by default; pass `--expiration 30d` if you want rotation,
+and revoke with `turso db tokens invalidate claude-vault` if one leaks.
 
 That's it — all commands now operate on the synced database:
 
@@ -271,7 +326,7 @@ The flags `--sync-url` and `--auth-token` work as one-off alternatives to the en
 
 If you use the [auto-archive hooks](#auto-archive-with-claude-code-hooks), export the two environment variables somewhere the hook commands can see them (or add the flags to the hook commands directly), and every machine archives into the same vault. UUID deduplication makes concurrent imports from multiple machines safe.
 
-Migrating an existing local vault: run `claude-vault import` once with sync enabled and your `~/.claude/projects` history is re-imported into the shared database. Sessions whose JSONL files are already gone can be carried over by exporting/re-importing, or just start the shared vault fresh from the machine with the most complete local database (copy that `vault.db` aside, then `turso db create claude-vault --from-file vault.db`).
+Migrating an existing local vault: a database created in local mode is a plain SQLite file, and sync mode refuses to open it (`db file exists but metadata file does not`) — the embedded replica must be built fresh from the server. Move the old `vault.db` aside (the installer script does this automatically), then run `claude-vault import` once with sync enabled and your `~/.claude/projects` history is re-imported into the shared database. Sessions whose JSONL files are already gone can be carried over by exporting/re-importing, or seed the shared vault from the old file directly with `turso db create claude-vault --from-file vault.db`.
 
 <details>
 <summary><h2>How It Works</h2></summary>
