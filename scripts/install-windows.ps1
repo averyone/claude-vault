@@ -13,12 +13,14 @@
 #     syncs natively on Windows.
 #   - Environment variables are persisted per-user via the registry instead
 #     of ~/.zshrc.
+#   - Requires PowerShell 7+ (pwsh). Windows PowerShell 5.1 cannot parse the
+#     Turso database JSON, which carries both 'Hostname' and 'hostname'.
 #   - settings.json is edited with PowerShell instead of python3.
 #
 # Safe to re-run: every step checks before it acts.
 #
-# Usage:  powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
-#         powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -NoWsl
+# Usage:  pwsh -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+#         pwsh -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -NoWsl
 #
 # -NoWsl skips WSL entirely: the Turso CLI is built natively with Go (Turso
 # ships no Windows binaries, but the CLI compiles fine) and used only for
@@ -30,6 +32,9 @@
 param([switch]$NoWsl)
 
 $ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+  Write-Error "This script requires PowerShell 7+. Run it with 'pwsh' rather than 'powershell' (install with: winget install --id Microsoft.PowerShell -e)."
+}
 # wsl.exe emits its own messages as UTF-16; this makes them UTF-8 so
 # captured output is comparable as normal strings.
 $env:WSL_UTF8 = '1'
@@ -49,6 +54,16 @@ function Show-Banner([string]$Title) {
   Write-Host ('=' * 68)
 }
 
+# winget reports benign outcomes as failures: 0x8A150061 (package already
+# installed) and 0x8A15002B (no applicable upgrade). Treat those as success --
+# each caller re-checks that the tool is actually present anyway.
+$WingetOkExitCodes = @(0, -1978335135, -1978335189)
+function Assert-Winget([string]$What) {
+  if ($LASTEXITCODE -notin $WingetOkExitCodes) {
+    Write-Error "$What failed (exit code $LASTEXITCODE)."
+  }
+}
+
 function Assert-LastExitCode([string]$What) {
   if ($LASTEXITCODE -ne 0) {
     Write-Error "$What failed (exit code $LASTEXITCODE)."
@@ -57,11 +72,16 @@ function Assert-LastExitCode([string]$What) {
 
 # turso CLI runner: the native Go-built binary in -NoWsl mode, otherwise
 # inside WSL, where the CLI is officially supported.
-function Invoke-Turso([string]$TursoArgs) {
+# $StdIn answers the CLI's interactive prompts: 'auth api-tokens revoke' asks
+# for [y/n] confirmation and aborts on EOF when nothing is piped in.
+function Invoke-Turso([string]$TursoArgs, [string]$StdIn) {
   if ($NoWsl) {
-    & turso ($TursoArgs -split ' ')
+    if ($PSBoundParameters.ContainsKey('StdIn')) { $StdIn | & turso ($TursoArgs -split ' ') }
+    else { & turso ($TursoArgs -split ' ') }
   } else {
-    wsl -e sh -c ('PATH="$HOME/.turso:$PATH" turso ' + $TursoArgs)
+    $Sh = 'PATH="$HOME/.turso:$PATH" turso ' + $TursoArgs
+    if ($PSBoundParameters.ContainsKey('StdIn')) { $StdIn | wsl -e sh -c $Sh }
+    else { wsl -e sh -c $Sh }
   }
 }
 
@@ -86,7 +106,12 @@ function Invoke-TursoApi {
     $Params.Body = ConvertTo-Json -InputObject $Body
     $Params.ContentType = 'application/json'
   }
-  Invoke-RestMethod @Params
+  # Not Invoke-RestMethod: Turso's database objects carry both 'Hostname' and
+  # 'hostname', and ConvertFrom-Json rejects keys differing only in case --
+  # Invoke-RestMethod swallows that failure and hands back the raw JSON string,
+  # so every property read silently comes out $null. -AsHashtable preserves the
+  # casing; property access on the resulting dictionaries reads the same.
+  (Invoke-WebRequest @Params).Content | ConvertFrom-Json -AsHashtable
 }
 
 if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -98,8 +123,10 @@ Show-Banner 'STEP 1: INSTALL MSVC BUILD TOOLS'
 # that rust's default x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
 # toolchain needs. Detected via vswhere, which ships with any VS installer.
 $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$HaveVcTools = (Test-Path $VsWhere) -and
-  ((& $VsWhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) -join '')
+$HaveVcTools = ''
+if (Test-Path $VsWhere) {
+  $HaveVcTools = (& $VsWhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) -join ''
+}
 if ($HaveVcTools) {
   Write-Host "MSVC Build Tools already installed at: $HaveVcTools"
 } else {
@@ -107,26 +134,30 @@ if ($HaveVcTools) {
   winget install --id Microsoft.VisualStudio.2022.BuildTools -e `
     --accept-package-agreements --accept-source-agreements `
     --override '--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
-  Assert-LastExitCode 'MSVC Build Tools installation'
+  Assert-Winget 'MSVC Build Tools installation'
   Write-Host ''
   Write-Host 'Build tools installed. Open a NEW terminal and RE-RUN this script.'
   exit 1
 }
 
 Show-Banner 'STEP 2: INSTALL RUSTUP'
+# rustup/cargo live in ~/.cargo/bin. A shell that was already open when rustup
+# was installed does not have it on PATH, so add it before probing -- otherwise
+# an existing install looks missing and winget is run again for nothing.
+$CargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+if ($env:Path -notlike "*$CargoBin*") {
+  $env:Path = "$CargoBin;$env:Path"
+  Write-Host "Added $CargoBin to PATH for this session."
+}
 if (Get-Command rustup -ErrorAction SilentlyContinue) {
   Write-Host "rustup already installed: $((rustup --version 2>$null | Select-Object -First 1))"
 } else {
   Write-Host 'rustup not found. Installing via winget...'
   winget install --id Rustlang.Rustup -e --accept-package-agreements --accept-source-agreements
-  Assert-LastExitCode 'rustup installation'
-}
-# Make cargo/rustup available to this session (new shells get it from the
-# PATH entry the rustup installer registers).
-$CargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
-if ($env:Path -notlike "*$CargoBin*") {
-  $env:Path = "$CargoBin;$env:Path"
-  Write-Host "Added $CargoBin to PATH for this session."
+  Assert-Winget 'rustup installation'
+  if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+    Write-Error 'rustup is still not on PATH after installation. Open a NEW terminal and re-run this script.'
+  }
 }
 
 Show-Banner 'STEP 3: VERIFY CARGO'
@@ -150,8 +181,11 @@ if ($NoWsl) {
     } else {
       Write-Host 'Go not found. Installing via winget...'
       winget install --id GoLang.Go -e --accept-package-agreements --accept-source-agreements
-      Assert-LastExitCode 'Go installation'
+      Assert-Winget 'Go installation'
       $env:Path = "$env:ProgramFiles\Go\bin;$env:Path"
+      if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+        Write-Error 'go is still not on PATH after installation. Open a NEW terminal and re-run this script.'
+      }
     }
     $GoBin = Join-Path $env:USERPROFILE 'go\bin'
     if ($env:Path -notlike "*$GoBin*") {
@@ -179,7 +213,7 @@ if ($NoWsl) {
     $TokenName = 'claude-vault-installer'
     $TokenList = @(Invoke-Turso 'auth api-tokens list')
     if (@($TokenList | Where-Object { $_.Trim() -match "^$TokenName(\s|$)" }).Count -gt 0) {
-      Invoke-Turso "auth api-tokens revoke $TokenName" | Out-Null
+      Invoke-Turso "auth api-tokens revoke $TokenName" -StdIn 'y' | Out-Null
     }
     $TursoApiToken = (Invoke-Turso "auth api-tokens mint $TokenName") -join ''
     if (-not $TursoApiToken -or $TursoApiToken -match ' ') {
@@ -193,7 +227,8 @@ if ($NoWsl) {
     Write-Error "Could not list Turso organizations - is the API token valid? ($_)"
   }
   # Tolerate both documented response shapes: a bare array or {organizations:[...]}
-  if ($Orgs.Count -eq 1 -and $Orgs[0].PSObject.Properties['organizations']) {
+  if ($Orgs.Count -eq 1 -and $Orgs[0] -is [System.Collections.IDictionary] -and
+      $Orgs[0].Contains('organizations')) {
     $Orgs = @($Orgs[0].organizations)
   }
   if ($Orgs.Count -eq 0) {
