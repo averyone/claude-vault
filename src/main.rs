@@ -15,6 +15,16 @@ struct Cli {
     #[arg(long, env = "CLAUDE_VAULT_DB")]
     db: Option<PathBuf>,
 
+    /// libSQL sync URL for multi-device sync (e.g. libsql://mydb-org.turso.io).
+    /// When set, the database becomes an embedded replica: reads stay local,
+    /// writes are forwarded to the sync server.
+    #[arg(long, env = "CLAUDE_VAULT_SYNC_URL")]
+    sync_url: Option<String>,
+
+    /// Auth token for the sync server (e.g. from `turso db tokens create`)
+    #[arg(long, env = "CLAUDE_VAULT_AUTH_TOKEN", hide_env_values = true)]
+    auth_token: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -103,6 +113,8 @@ enum Commands {
     Stats,
     /// Verify database integrity
     Verify,
+    /// Pull the latest state from the sync server (requires --sync-url)
+    Sync,
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -142,7 +154,7 @@ fn default_claude_dir() -> Result<PathBuf> {
     Ok(home.join(".claude"))
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Handle completions before opening DB (no DB needed)
@@ -157,7 +169,14 @@ fn run() -> Result<()> {
         None => default_db_path()?,
     };
 
-    let conn = db::open_db(&db_path)?;
+    let sync = match (cli.sync_url, cli.auth_token) {
+        (Some(url), auth_token) => Some(db::SyncOptions { url, auth_token }),
+        (None, Some(_)) => bail!("--auth-token requires --sync-url"),
+        (None, None) => None,
+    };
+
+    let vault = db::open_vault(&db_path, sync).await?;
+    let conn = &vault.conn;
 
     match cli.command {
         Commands::Import { claude_dir } => {
@@ -165,15 +184,17 @@ fn run() -> Result<()> {
                 Some(d) => d,
                 None => default_claude_dir()?,
             };
-            import::import_all(&conn, &claude_dir)?;
+            import::import_all(conn, &claude_dir).await?;
+            vault.sync_after_write().await;
         }
         Commands::ImportFile { path, project } => {
             let project = project.unwrap_or_else(|| "unknown".to_string());
-            let stats = import::import_jsonl_file(&conn, &path, &project)?;
+            let stats = import::import_jsonl_file(conn, &path, &project).await?;
             println!(
                 "Imported {} messages ({} skipped, {} filtered, {} errors)",
                 stats.imported, stats.skipped, stats.filtered, stats.errors
             );
+            vault.sync_after_write().await;
         }
         Commands::Search {
             query,
@@ -186,14 +207,15 @@ fn run() -> Result<()> {
             include_tools,
         } => {
             let results = db::search(
-                &conn,
+                conn,
                 &query,
                 limit,
                 project.as_deref(),
                 role.as_deref(),
                 since.as_deref(),
                 until.as_deref(),
-            )?;
+            )
+            .await?;
             let strip = !include_tools;
             if json {
                 let json_results: Vec<serde_json::Value> = results
@@ -264,11 +286,11 @@ fn run() -> Result<()> {
         } => {
             let resolved_id = match (session_id, last) {
                 (_, Some(0)) => bail!("--last must be at least 1"),
-                (_, Some(n)) => db::nth_recent_session_id(&conn, n.saturating_sub(1))?,
-                (Some(prefix), None) => db::resolve_session_id(&conn, &prefix)?,
+                (_, Some(n)) => db::nth_recent_session_id(conn, n.saturating_sub(1)).await?,
+                (Some(prefix), None) => db::resolve_session_id(conn, &prefix).await?,
                 (None, None) => bail!("Specify a session ID or use --last"),
             };
-            let messages = db::get_session_messages(&conn, &resolved_id)?;
+            let messages = db::get_session_messages(conn, &resolved_id).await?;
             if messages.is_empty() {
                 bail!("No messages found for session: {resolved_id}");
             }
@@ -334,12 +356,13 @@ fn run() -> Result<()> {
         } => {
             let limit = if limit == 0 { usize::MAX } else { limit };
             let sessions = db::list_sessions(
-                &conn,
+                conn,
                 limit,
                 project.as_deref(),
                 since.as_deref(),
                 until.as_deref(),
-            )?;
+            )
+            .await?;
             if json {
                 let json_sessions: Vec<serde_json::Value> = sessions
                     .iter()
@@ -397,8 +420,8 @@ fn run() -> Result<()> {
             println!("\nExport: claude-vault export <ID>");
         }
         Commands::Delete { session_id, yes } => {
-            let resolved_id = db::resolve_session_id(&conn, &session_id)?;
-            let messages = db::get_session_messages(&conn, &resolved_id)?;
+            let resolved_id = db::resolve_session_id(conn, &session_id).await?;
+            let messages = db::get_session_messages(conn, &resolved_id).await?;
             let msg_count = messages.len();
             let project = messages
                 .first()
@@ -415,17 +438,33 @@ fn run() -> Result<()> {
                 }
             }
 
-            let deleted = db::delete_session(&conn, &resolved_id)?;
+            let deleted = db::delete_session(conn, &resolved_id).await?;
             println!("Deleted session {resolved_id} ({deleted} messages removed)");
+            vault.sync_after_write().await;
         }
         Commands::Stats => {
-            let (sessions, messages) = db::stats(&conn)?;
+            let (sessions, messages) = db::stats(conn).await?;
             println!("Database: {}", db_path.display());
+            println!(
+                "Mode: {}",
+                if vault.sync_enabled() {
+                    "synced (embedded replica)"
+                } else {
+                    "local"
+                }
+            );
             println!("Sessions: {}", sessions);
             println!("Messages: {}", messages);
         }
         Commands::Verify => {
-            db::verify(&conn)?;
+            db::verify(conn).await?;
+        }
+        Commands::Sync => {
+            let frames = vault.sync().await?;
+            let (sessions, messages) = db::stats(conn).await?;
+            println!("Sync complete ({frames} frames applied)");
+            println!("Sessions: {sessions}");
+            println!("Messages: {messages}");
         }
         Commands::Completions { .. } => unreachable!(),
     }
@@ -433,8 +472,9 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }

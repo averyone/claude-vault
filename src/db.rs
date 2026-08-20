@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use anyhow::{anyhow, Context, Result};
+use libsql::{params, Builder, Connection, Database};
 use std::path::Path;
 
 /// Convert project directory names like "-home-murou-ghq-github-com-user-repo" to "user/repo"
@@ -27,22 +27,141 @@ pub fn format_project_name(raw: &str) -> String {
     }
 }
 
-pub fn open_db(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)
-        .with_context(|| format!("Failed to open database: {}", path.display()))?;
-
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA busy_timeout=5000;
-         PRAGMA foreign_keys=ON;",
-    )?;
-
-    init_schema(&conn)?;
-
-    Ok(conn)
+/// Configuration for multi-device sync via a libSQL sync server (e.g. Turso or self-hosted sqld).
+pub struct SyncOptions {
+    pub url: String,
+    pub auth_token: Option<String>,
 }
 
-fn init_schema(conn: &Connection) -> Result<()> {
+/// An open vault database. In local mode this is a plain SQLite file; in sync mode
+/// it is a libSQL embedded replica: reads are served from the local file, writes are
+/// forwarded to the sync server, and `sync()` pulls remote changes into the replica.
+pub struct Vault {
+    db: Database,
+    pub conn: Connection,
+    sync_enabled: bool,
+}
+
+impl Vault {
+    pub fn sync_enabled(&self) -> bool {
+        self.sync_enabled
+    }
+
+    /// Pull the latest state from the sync server into the local replica.
+    /// Returns the number of frames applied.
+    pub async fn sync(&self) -> Result<u64> {
+        if !self.sync_enabled {
+            anyhow::bail!(
+                "Sync is not enabled. Pass --sync-url (or set CLAUDE_VAULT_SYNC_URL) to use a synced database."
+            );
+        }
+        let replicated = self
+            .db
+            .sync()
+            .await
+            .context("Failed to sync with the remote database")?;
+        Ok(replicated.frames_synced() as u64)
+    }
+
+    /// Best-effort sync after local writes so the replica reflects them immediately.
+    /// Failures are downgraded to a warning: the writes already reached the primary,
+    /// and the next successful sync will catch the replica up.
+    pub async fn sync_after_write(&self) {
+        if self.sync_enabled {
+            if let Err(e) = self.db.sync().await {
+                eprintln!("Warning: post-write sync failed (will catch up on next sync): {e:#}");
+            }
+        }
+    }
+}
+
+pub async fn open_vault(path: &Path, sync: Option<SyncOptions>) -> Result<Vault> {
+    let (db, sync_enabled) = match sync {
+        Some(opts) => {
+            let db = Builder::new_remote_replica(
+                path,
+                opts.url.clone(),
+                opts.auth_token.unwrap_or_default(),
+            )
+            .build()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open synced database {} (sync URL: {})",
+                    path.display(),
+                    opts.url
+                )
+            })?;
+            (db, true)
+        }
+        None => {
+            let db = Builder::new_local(path)
+                .build()
+                .await
+                .with_context(|| format!("Failed to open database: {}", path.display()))?;
+            (db, false)
+        }
+    };
+
+    let conn = db.connect()?;
+    let vault = Vault {
+        db,
+        conn,
+        sync_enabled,
+    };
+
+    if vault.sync_enabled {
+        // Pull the latest remote state before doing anything. Tolerate failure so
+        // read commands still work offline against the (possibly stale) replica.
+        if let Err(e) = vault.db.sync().await {
+            eprintln!("Warning: could not sync with remote (using local replica): {e:#}");
+        }
+    } else {
+        vault
+            .conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .await?;
+    }
+
+    // Skip DDL when the schema is already current. This matters in sync mode, where
+    // DDL statements are forwarded to the remote primary on every invocation.
+    if !schema_is_current(&vault.conn).await? {
+        init_schema(&vault.conn).await?;
+    }
+
+    Ok(vault)
+}
+
+/// Fetch the first row of a query, erroring if there is none.
+async fn query_row(
+    conn: &Connection,
+    sql: &str,
+    params: impl libsql::params::IntoParams,
+) -> Result<libsql::Row> {
+    let mut rows = conn.query(sql, params).await?;
+    rows.next()
+        .await?
+        .ok_or_else(|| anyhow!("Query returned no rows"))
+}
+
+async fn schema_is_current(conn: &Connection) -> Result<bool> {
+    let row = query_row(
+        conn,
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'),
+                (SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts')",
+        (),
+    )
+    .await?;
+    let has_sessions: i64 = row.get(0)?;
+    let fts_sql: Option<String> = row.get(1)?;
+    Ok(has_sessions == 1 && fts_sql.is_some_and(|sql| sql.contains("porter")))
+}
+
+async fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS sessions (
@@ -65,10 +184,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uuid
             ON messages(uuid) WHERE uuid IS NOT NULL;
         ",
-    )?;
+    )
+    .await?;
 
     // Create FTS table with Porter stemming, or migrate from old schema
-    migrate_fts(conn)?;
+    migrate_fts(conn).await?;
 
     conn.execute_batch(
         "
@@ -85,26 +205,33 @@ fn init_schema(conn: &Connection) -> Result<()> {
             INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
         END;
         ",
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Ensure the FTS table uses Porter stemming tokenizer.
 /// Migrates from the old tokenizer if needed.
-fn migrate_fts(conn: &Connection) -> Result<()> {
-    let fts_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')",
-        [],
-        |row| row.get(0),
-    )?;
+async fn migrate_fts(conn: &Connection) -> Result<()> {
+    let fts_exists: bool = {
+        let row = query_row(
+            conn,
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')",
+            (),
+        )
+        .await?;
+        row.get::<i64>(0)? == 1
+    };
 
     if fts_exists {
         // Check if the FTS table already uses porter tokenizer
-        let create_sql: String = conn.query_row(
+        let row = query_row(
+            conn,
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'",
-            [],
-            |row| row.get(0),
-        )?;
+            (),
+        )
+        .await?;
+        let create_sql: String = row.get(0)?;
 
         if create_sql.contains("porter") {
             return Ok(());
@@ -119,7 +246,8 @@ fn migrate_fts(conn: &Connection) -> Result<()> {
             DROP TRIGGER IF EXISTS messages_au;
             DROP TABLE messages_fts;
             ",
-        )?;
+        )
+        .await?;
     }
 
     conn.execute_batch(
@@ -131,18 +259,20 @@ fn migrate_fts(conn: &Connection) -> Result<()> {
             tokenize='porter unicode61'
         );
         ",
-    )?;
+    )
+    .await?;
 
     // If migrating from old schema, rebuild the index from existing messages
     if fts_exists {
-        conn.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")?;
+        conn.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            .await?;
         eprintln!("FTS index rebuilt with Porter stemming.");
     }
 
     Ok(())
 }
 
-pub fn upsert_session(
+pub async fn upsert_session(
     conn: &Connection,
     session_id: &str,
     project: &str,
@@ -155,11 +285,12 @@ pub fn upsert_session(
             project = excluded.project,
             started_at = COALESCE(excluded.started_at, sessions.started_at)",
         params![session_id, project, started_at],
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
-pub fn insert_message(
+pub async fn insert_message(
     conn: &Connection,
     session_id: &str,
     uuid: Option<&str>,
@@ -167,24 +298,17 @@ pub fn insert_message(
     content: &str,
     timestamp: Option<&str>,
 ) -> Result<bool> {
-    // Skip if uuid already exists
-    if let Some(uuid_val) = uuid {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE uuid = ?1)",
-            params![uuid_val],
-            |row| row.get(0),
-        )?;
-        if exists {
-            return Ok(false);
-        }
-    }
-
-    conn.execute(
-        "INSERT INTO messages (session_id, uuid, role, content, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![session_id, uuid, role, content, timestamp],
-    )?;
-    Ok(true)
+    // The unique index on uuid makes OR IGNORE skip duplicates in a single
+    // statement — one round trip instead of a SELECT-then-INSERT pair, which
+    // matters in sync mode where writes are forwarded to the remote primary.
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO messages (session_id, uuid, role, content, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, uuid, role, content, timestamp],
+        )
+        .await?;
+    Ok(inserted > 0)
 }
 
 pub struct SearchResult {
@@ -221,7 +345,12 @@ fn normalize_project_filter(filter: &str) -> String {
     format!("%{normalized}%")
 }
 
-pub fn search(
+fn limit_param(limit: usize) -> i64 {
+    // SQLite treats a negative LIMIT as "no limit"
+    i64::try_from(limit).unwrap_or(-1)
+}
+
+pub async fn search(
     conn: &Connection,
     query: &str,
     limit: usize,
@@ -262,59 +391,59 @@ pub fn search(
     }
     sql.push_str(&format!(" ORDER BY rank LIMIT ?{param_idx}"));
 
-    let mut stmt = conn.prepare(&sql)?;
-
-    // Build dynamic params
-    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    params_vec.push(Box::new(escaped));
+    let mut params_vec: Vec<libsql::Value> = vec![escaped.into()];
     if let Some(proj) = project_filter {
-        params_vec.push(Box::new(normalize_project_filter(proj)));
+        params_vec.push(normalize_project_filter(proj).into());
     }
     if let Some(role) = role_filter {
-        params_vec.push(Box::new(role.to_string()));
+        params_vec.push(role.to_string().into());
     }
     if let Some(s) = since {
-        params_vec.push(Box::new(s.to_string()));
+        params_vec.push(s.to_string().into());
     }
     if let Some(u) = until {
-        params_vec.push(Box::new(u.to_string()));
+        params_vec.push(u.to_string().into());
     }
-    params_vec.push(Box::new(limit as i64));
+    params_vec.push(limit_param(limit).into());
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params_vec.iter().map(|p| p.as_ref()).collect();
-
-    let results = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(SearchResult {
-                session_id: row.get(0)?,
-                project: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                timestamp: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = conn.query(&sql, params_vec).await?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        results.push(SearchResult {
+            session_id: row.get(0)?,
+            project: row.get(1)?,
+            role: row.get(2)?,
+            content: row.get(3)?,
+            timestamp: row.get(4)?,
+        });
+    }
 
     Ok(results)
 }
 
-pub fn stats(conn: &Connection) -> Result<(i64, i64)> {
-    let session_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
-    let message_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+pub async fn stats(conn: &Connection) -> Result<(i64, i64)> {
+    let session_count: i64 = query_row(conn, "SELECT COUNT(*) FROM sessions", ())
+        .await?
+        .get(0)?;
+    let message_count: i64 = query_row(conn, "SELECT COUNT(*) FROM messages", ())
+        .await?
+        .get(0)?;
     Ok((session_count, message_count))
 }
 
 /// Resolve a session ID prefix to a full session ID.
 /// Returns an error if the prefix matches zero or multiple sessions.
-pub fn resolve_session_id(conn: &Connection, prefix: &str) -> Result<String> {
-    let mut stmt =
-        conn.prepare("SELECT session_id FROM sessions WHERE session_id LIKE ?1 || '%'")?;
-    let matches: Vec<String> = stmt
-        .query_map(params![prefix], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+pub async fn resolve_session_id(conn: &Connection, prefix: &str) -> Result<String> {
+    let mut rows = conn
+        .query(
+            "SELECT session_id FROM sessions WHERE session_id LIKE ?1 || '%'",
+            params![prefix],
+        )
+        .await?;
+    let mut matches: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        matches.push(row.get(0)?);
+    }
 
     match matches.len() {
         0 => anyhow::bail!("No session found matching: {prefix}"),
@@ -329,40 +458,49 @@ pub fn resolve_session_id(conn: &Connection, prefix: &str) -> Result<String> {
     }
 }
 
-pub fn get_session_messages(conn: &Connection, session_id: &str) -> Result<Vec<SearchResult>> {
-    let mut stmt = conn.prepare(
-        "SELECT m.session_id, s.project, m.role, m.content, m.timestamp
-         FROM messages m
-         JOIN sessions s ON s.session_id = m.session_id
-         WHERE m.session_id = ?1
-         ORDER BY m.id ASC",
-    )?;
+pub async fn get_session_messages(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SearchResult>> {
+    let mut rows = conn
+        .query(
+            "SELECT m.session_id, s.project, m.role, m.content, m.timestamp
+             FROM messages m
+             JOIN sessions s ON s.session_id = m.session_id
+             WHERE m.session_id = ?1
+             ORDER BY m.id ASC",
+            params![session_id],
+        )
+        .await?;
 
-    let results = stmt
-        .query_map(params![session_id], |row| {
-            Ok(SearchResult {
-                session_id: row.get(0)?,
-                project: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                timestamp: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await? {
+        results.push(SearchResult {
+            session_id: row.get(0)?,
+            project: row.get(1)?,
+            role: row.get(2)?,
+            content: row.get(3)?,
+            timestamp: row.get(4)?,
+        });
+    }
 
     Ok(results)
 }
 
 /// Get the Nth most recent session ID (0-indexed).
-pub fn nth_recent_session_id(conn: &Connection, n: usize) -> Result<String> {
-    conn.query_row(
-        "SELECT session_id FROM sessions
-         ORDER BY COALESCE(started_at, imported_at) DESC
-         LIMIT 1 OFFSET ?1",
-        params![n as i64],
-        |row| row.get(0),
-    )
-    .with_context(|| format!("No session found at position {}", n + 1))
+pub async fn nth_recent_session_id(conn: &Connection, n: usize) -> Result<String> {
+    let mut rows = conn
+        .query(
+            "SELECT session_id FROM sessions
+             ORDER BY COALESCE(started_at, imported_at) DESC
+             LIMIT 1 OFFSET ?1",
+            params![n as i64],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get(0)?),
+        None => anyhow::bail!("No session found at position {}", n + 1),
+    }
 }
 
 pub struct SessionSummary {
@@ -373,7 +511,7 @@ pub struct SessionSummary {
     pub first_user_message: Option<String>,
 }
 
-pub fn list_sessions(
+pub async fn list_sessions(
     conn: &Connection,
     limit: usize,
     project_filter: Option<&str>,
@@ -412,59 +550,61 @@ pub fn list_sessions(
         " ORDER BY COALESCE(s.started_at, s.imported_at) DESC LIMIT ?{param_idx}"
     ));
 
-    let mut stmt = conn.prepare(&sql)?;
-
-    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut params_vec: Vec<libsql::Value> = Vec::new();
     if let Some(proj) = project_filter {
-        params_vec.push(Box::new(normalize_project_filter(proj)));
+        params_vec.push(normalize_project_filter(proj).into());
     }
     if let Some(s) = since {
-        params_vec.push(Box::new(s.to_string()));
+        params_vec.push(s.to_string().into());
     }
     if let Some(u) = until {
-        params_vec.push(Box::new(u.to_string()));
+        params_vec.push(u.to_string().into());
     }
-    params_vec.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params_vec.iter().map(|p| p.as_ref()).collect();
+    params_vec.push(limit_param(limit).into());
 
-    let mut sessions: Vec<SessionSummary> = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(SessionSummary {
-                session_id: row.get(0)?,
-                project: row.get(1)?,
-                started_at: row.get(2)?,
-                message_count: row.get(3)?,
-                first_user_message: None,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = conn.query(&sql, params_vec).await?;
+    let mut sessions: Vec<SessionSummary> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        sessions.push(SessionSummary {
+            session_id: row.get(0)?,
+            project: row.get(1)?,
+            started_at: row.get(2)?,
+            message_count: row.get(3)?,
+            first_user_message: None,
+        });
+    }
 
     // Fetch first meaningful user message for each session
-    let mut user_stmt = conn.prepare(
-        "SELECT substr(content, 1, 200) FROM messages
-         WHERE session_id = ?1 AND role = 'user'
-         ORDER BY id ASC LIMIT 10",
-    )?;
-    // Fallback: first assistant message
-    let mut asst_stmt = conn.prepare(
-        "SELECT substr(content, 1, 200) FROM messages
-         WHERE session_id = ?1 AND role = 'assistant'
-         ORDER BY id ASC LIMIT 3",
-    )?;
-
     for session in &mut sessions {
-        let candidates: Vec<String> = user_stmt
-            .query_map(params![&session.session_id], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut candidates: Vec<String> = Vec::new();
+        let mut rows = conn
+            .query(
+                "SELECT substr(content, 1, 200) FROM messages
+                 WHERE session_id = ?1 AND role = 'user'
+                 ORDER BY id ASC LIMIT 10",
+                params![session.session_id.as_str()],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            candidates.push(row.get(0)?);
+        }
 
         session.first_user_message = candidates.into_iter().find(|c| is_meaningful_preview(c));
 
         // If no meaningful user message found, try assistant messages
         if session.first_user_message.is_none() {
-            let asst_candidates: Vec<String> = asst_stmt
-                .query_map(params![&session.session_id], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut asst_candidates: Vec<String> = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT substr(content, 1, 200) FROM messages
+                     WHERE session_id = ?1 AND role = 'assistant'
+                     ORDER BY id ASC LIMIT 3",
+                    params![session.session_id.as_str()],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                asst_candidates.push(row.get(0)?);
+            }
             session.first_user_message = asst_candidates
                 .into_iter()
                 .find(|c| is_meaningful_preview(c));
@@ -500,65 +640,76 @@ fn is_meaningful_preview(content: &str) -> bool {
     true
 }
 
-pub fn delete_session(conn: &Connection, session_id: &str) -> Result<u64> {
-    let msg_deleted = conn.execute(
-        "DELETE FROM messages WHERE session_id = ?1",
-        params![session_id],
-    )?;
+pub async fn delete_session(conn: &Connection, session_id: &str) -> Result<u64> {
+    let msg_deleted = conn
+        .execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .await?;
     conn.execute(
         "DELETE FROM sessions WHERE session_id = ?1",
         params![session_id],
-    )?;
-    Ok(msg_deleted as u64)
+    )
+    .await?;
+    Ok(msg_deleted)
 }
 
-pub fn verify(conn: &Connection) -> Result<()> {
+pub async fn verify(conn: &Connection) -> Result<()> {
     println!("=== 1. Messages by role ===");
-    let mut stmt = conn.prepare("SELECT role, COUNT(*) FROM messages GROUP BY role")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    for row in rows {
-        let (role, count) = row?;
+    let mut rows = conn
+        .query("SELECT role, COUNT(*) FROM messages GROUP BY role", ())
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let role: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
         println!("  {role}: {count}");
     }
 
     println!("\n=== 2. Sessions and projects ===");
-    let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-    let project_count: i64 =
-        conn.query_row("SELECT COUNT(DISTINCT project) FROM sessions", [], |r| {
-            r.get(0)
-        })?;
+    let session_count: i64 = query_row(conn, "SELECT COUNT(*) FROM sessions", ())
+        .await?
+        .get(0)?;
+    let project_count: i64 = query_row(conn, "SELECT COUNT(DISTINCT project) FROM sessions", ())
+        .await?
+        .get(0)?;
     println!("  Sessions: {session_count}, Projects: {project_count}");
 
     println!("\n=== 3. Top 5 projects by message count ===");
-    let mut stmt = conn.prepare(
-        "SELECT s.project, COUNT(*) as cnt FROM messages m
-         JOIN sessions s ON s.session_id = m.session_id
-         GROUP BY s.project ORDER BY cnt DESC LIMIT 5",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    for row in rows {
-        let (proj, count) = row?;
+    let mut rows = conn
+        .query(
+            "SELECT s.project, COUNT(*) as cnt FROM messages m
+             JOIN sessions s ON s.session_id = m.session_id
+             GROUP BY s.project ORDER BY cnt DESC LIMIT 5",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let proj: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
         println!("  {}: {count}", format_project_name(&proj));
     }
 
     println!("\n=== 4. FTS index integrity ===");
-    let msg_count: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
-    let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))?;
+    let msg_count: i64 = query_row(conn, "SELECT COUNT(*) FROM messages", ())
+        .await?
+        .get(0)?;
+    let fts_count: i64 = query_row(conn, "SELECT COUNT(*) FROM messages_fts", ())
+        .await?
+        .get(0)?;
     let fts_ok = msg_count == fts_count;
     println!("  messages: {msg_count} rows");
     println!("  messages_fts: {fts_count} rows");
     println!("  Match: {}", if fts_ok { "OK" } else { "FAIL" });
 
     println!("\n=== 5. UUID deduplication ===");
-    let dup_count: i64 = conn.query_row(
+    let dup_count: i64 = query_row(
+        conn,
         "SELECT COUNT(*) FROM (SELECT uuid, COUNT(*) as cnt FROM messages WHERE uuid IS NOT NULL GROUP BY uuid HAVING cnt > 1)",
-        [],
-        |r| r.get(0),
-    )?;
+        (),
+    )
+    .await?
+    .get(0)?;
     let dup_ok = dup_count == 0;
     println!(
         "  Duplicate UUIDs: {dup_count} {}",
@@ -566,31 +717,31 @@ pub fn verify(conn: &Connection) -> Result<()> {
     );
 
     println!("\n=== 6. Recent message samples ===");
-    let mut stmt = conn.prepare(
-        "SELECT m.role, substr(m.content, 1, 120), m.timestamp
-         FROM messages m JOIN sessions s ON s.session_id = m.session_id
-         ORDER BY m.timestamp DESC LIMIT 10",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (role, content, ts) = row?;
+    let mut rows = conn
+        .query(
+            "SELECT m.role, substr(m.content, 1, 120), m.timestamp
+             FROM messages m JOIN sessions s ON s.session_id = m.session_id
+             ORDER BY m.timestamp DESC LIMIT 10",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let ts: Option<String> = row.get(2)?;
         let content = content.replace('\n', " ");
         println!("  [{role}] {} | {content}", ts.as_deref().unwrap_or("?"));
     }
 
     println!("\n=== 7. FTS5 search test ===");
     for query in ["import", "SQLite", "cargo"] {
-        let count: i64 = conn.query_row(
+        let count: i64 = query_row(
+            conn,
             "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
             params![query],
-            |r| r.get(0),
-        )?;
+        )
+        .await?
+        .get(0)?;
         println!("  \"{query}\": {count} hits");
     }
 
@@ -604,239 +755,341 @@ pub fn verify(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
-    fn setup_db() -> (Connection, NamedTempFile) {
-        let tmp = NamedTempFile::new().unwrap();
-        let conn = open_db(tmp.path()).unwrap();
-        (conn, tmp)
+    async fn setup_db() -> (Vault, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let vault = open_vault(&tmp.path().join("test.db"), None).await.unwrap();
+        (vault, tmp)
     }
 
-    #[test]
-    fn test_open_and_init() {
-        let (_conn, _tmp) = setup_db();
+    #[tokio::test]
+    async fn test_open_and_init() {
+        let (_vault, _tmp) = setup_db().await;
     }
 
-    #[test]
-    fn test_upsert_session() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "sess-1", "my-project", Some("2024-01-01T00:00:00Z")).unwrap();
-        upsert_session(&conn, "sess-1", "my-project", None).unwrap();
+    #[tokio::test]
+    async fn test_reopen_existing_db() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test.db");
+        {
+            let vault = open_vault(&path, None).await.unwrap();
+            upsert_session(&vault.conn, "s1", "proj", None)
+                .await
+                .unwrap();
+        }
+        // Second open must detect the existing schema and skip re-init
+        let vault = open_vault(&path, None).await.unwrap();
+        let (sessions, _) = stats(&vault.conn).await.unwrap();
+        assert_eq!(sessions, 1);
+    }
 
-        let project: String = conn
-            .query_row(
-                "SELECT project FROM sessions WHERE session_id = 'sess-1'",
-                [],
-                |row| row.get(0),
-            )
+    #[tokio::test]
+    async fn test_upsert_session() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "sess-1", "my-project", Some("2024-01-01T00:00:00Z"))
+            .await
             .unwrap();
+        upsert_session(conn, "sess-1", "my-project", None)
+            .await
+            .unwrap();
+
+        let project: String = query_row(
+            conn,
+            "SELECT project FROM sessions WHERE session_id = 'sess-1'",
+            (),
+        )
+        .await
+        .unwrap()
+        .get(0)
+        .unwrap();
         assert_eq!(project, "my-project");
     }
 
-    #[test]
-    fn test_insert_and_search() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "sess-1", "proj", None).unwrap();
+    #[tokio::test]
+    async fn test_insert_and_search() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "sess-1", "proj", None).await.unwrap();
         insert_message(
-            &conn,
+            conn,
             "sess-1",
             Some("u1"),
             "user",
             "hello world",
             Some("2024-01-01T00:00:00Z"),
         )
+        .await
         .unwrap();
         insert_message(
-            &conn,
+            conn,
             "sess-1",
             Some("u2"),
             "assistant",
             "hi there",
             Some("2024-01-01T00:00:01Z"),
         )
+        .await
         .unwrap();
 
-        let results = search(&conn, "hello", 10, None, None, None, None).unwrap();
+        let results = search(conn, "hello", 10, None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].role, "user");
         assert_eq!(results[0].content, "hello world");
     }
 
-    #[test]
-    fn test_porter_stemming() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "proj", None).unwrap();
+    #[tokio::test]
+    async fn test_porter_stemming() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "proj", None).await.unwrap();
         insert_message(
-            &conn,
+            conn,
             "s1",
             Some("u1"),
             "user",
             "the server is running fine",
             None,
         )
+        .await
         .unwrap();
         insert_message(
-            &conn,
+            conn,
             "s1",
             Some("u2"),
             "user",
             "configure the database settings",
             None,
         )
+        .await
         .unwrap();
 
         // "run" should match "running" via stemming
-        let results = search(&conn, "run", 10, None, None, None, None).unwrap();
+        let results = search(conn, "run", 10, None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("running"));
 
         // "configuration" should match "configure" via stemming
-        let results = search(&conn, "configuration", 10, None, None, None, None).unwrap();
+        let results = search(conn, "configuration", 10, None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("configure"));
     }
 
-    #[test]
-    fn test_duplicate_uuid_skipped() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "sess-1", "proj", None).unwrap();
-        let inserted = insert_message(&conn, "sess-1", Some("u1"), "user", "first", None).unwrap();
+    #[tokio::test]
+    async fn test_duplicate_uuid_skipped() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "sess-1", "proj", None).await.unwrap();
+        let inserted = insert_message(conn, "sess-1", Some("u1"), "user", "first", None)
+            .await
+            .unwrap();
         assert!(inserted);
-        let inserted =
-            insert_message(&conn, "sess-1", Some("u1"), "user", "duplicate", None).unwrap();
+        let inserted = insert_message(conn, "sess-1", Some("u1"), "user", "duplicate", None)
+            .await
+            .unwrap();
         assert!(!inserted);
 
-        let (_, msg_count) = stats(&conn).unwrap();
+        let (_, msg_count) = stats(conn).await.unwrap();
         assert_eq!(msg_count, 1);
     }
 
-    #[test]
-    fn test_stats() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "p1", None).unwrap();
-        upsert_session(&conn, "s2", "p2", None).unwrap();
-        insert_message(&conn, "s1", Some("u1"), "user", "msg1", None).unwrap();
-        insert_message(&conn, "s1", Some("u2"), "assistant", "msg2", None).unwrap();
-        insert_message(&conn, "s2", Some("u3"), "user", "msg3", None).unwrap();
+    #[tokio::test]
+    async fn test_stats() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "p1", None).await.unwrap();
+        upsert_session(conn, "s2", "p2", None).await.unwrap();
+        insert_message(conn, "s1", Some("u1"), "user", "msg1", None)
+            .await
+            .unwrap();
+        insert_message(conn, "s1", Some("u2"), "assistant", "msg2", None)
+            .await
+            .unwrap();
+        insert_message(conn, "s2", Some("u3"), "user", "msg3", None)
+            .await
+            .unwrap();
 
-        let (sessions, messages) = stats(&conn).unwrap();
+        let (sessions, messages) = stats(conn).await.unwrap();
         assert_eq!(sessions, 2);
         assert_eq!(messages, 3);
     }
 
-    #[test]
-    fn test_search_no_results() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "proj", None).unwrap();
-        insert_message(&conn, "s1", Some("u1"), "user", "hello", None).unwrap();
+    #[tokio::test]
+    async fn test_search_no_results() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "proj", None).await.unwrap();
+        insert_message(conn, "s1", Some("u1"), "user", "hello", None)
+            .await
+            .unwrap();
 
-        let results = search(&conn, "nonexistent", 10, None, None, None, None).unwrap();
+        let results = search(conn, "nonexistent", 10, None, None, None, None)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_search_with_date_filter() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "proj", None).unwrap();
+    #[tokio::test]
+    async fn test_search_with_date_filter() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "proj", None).await.unwrap();
         insert_message(
-            &conn,
+            conn,
             "s1",
             Some("u1"),
             "user",
             "early message",
             Some("2024-01-01T00:00:00Z"),
         )
+        .await
         .unwrap();
         insert_message(
-            &conn,
+            conn,
             "s1",
             Some("u2"),
             "user",
             "late message",
             Some("2024-06-01T00:00:00Z"),
         )
+        .await
         .unwrap();
 
-        let results = search(&conn, "message", 10, None, None, Some("2024-03-01"), None).unwrap();
+        let results = search(conn, "message", 10, None, None, Some("2024-03-01"), None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("late"));
 
-        let results = search(&conn, "message", 10, None, None, None, Some("2024-03-01")).unwrap();
+        let results = search(conn, "message", 10, None, None, None, Some("2024-03-01"))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("early"));
     }
 
-    #[test]
-    fn test_search_empty_query() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "proj", None).unwrap();
-        insert_message(&conn, "s1", Some("u1"), "user", "hello", None).unwrap();
+    #[tokio::test]
+    async fn test_search_empty_query() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "proj", None).await.unwrap();
+        insert_message(conn, "s1", Some("u1"), "user", "hello", None)
+            .await
+            .unwrap();
 
-        let results = search(&conn, "", 10, None, None, None, None).unwrap();
+        let results = search(conn, "", 10, None, None, None, None).await.unwrap();
         assert!(results.is_empty());
 
-        let results = search(&conn, "   ", 10, None, None, None, None).unwrap();
+        let results = search(conn, "   ", 10, None, None, None, None)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_project_filter_with_slash() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "-home-user-ghq-github-com-owner-repo", None).unwrap();
-        insert_message(&conn, "s1", Some("u1"), "user", "test msg", None).unwrap();
+    #[tokio::test]
+    async fn test_project_filter_with_slash() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "-home-user-ghq-github-com-owner-repo", None)
+            .await
+            .unwrap();
+        insert_message(conn, "s1", Some("u1"), "user", "test msg", None)
+            .await
+            .unwrap();
 
         // Filter with formatted name "owner/repo"
-        let results = search(&conn, "test", 10, Some("owner/repo"), None, None, None).unwrap();
+        let results = search(conn, "test", 10, Some("owner/repo"), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
 
         // Filter with just "repo"
-        let results = search(&conn, "test", 10, Some("repo"), None, None, None).unwrap();
+        let results = search(conn, "test", 10, Some("repo"), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
-    #[test]
-    fn test_delete_session() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "proj", None).unwrap();
-        insert_message(&conn, "s1", Some("u1"), "user", "msg1", None).unwrap();
-        insert_message(&conn, "s1", Some("u2"), "assistant", "msg2", None).unwrap();
+    #[tokio::test]
+    async fn test_delete_session() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "proj", None).await.unwrap();
+        insert_message(conn, "s1", Some("u1"), "user", "msg1", None)
+            .await
+            .unwrap();
+        insert_message(conn, "s1", Some("u2"), "assistant", "msg2", None)
+            .await
+            .unwrap();
 
-        let deleted = delete_session(&conn, "s1").unwrap();
+        let deleted = delete_session(conn, "s1").await.unwrap();
         assert_eq!(deleted, 2);
 
-        let (sessions, messages) = stats(&conn).unwrap();
+        let (sessions, messages) = stats(conn).await.unwrap();
         assert_eq!(sessions, 0);
         assert_eq!(messages, 0);
     }
 
-    #[test]
-    fn test_list_sessions_with_date_filter() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "proj", Some("2024-01-15T00:00:00Z")).unwrap();
-        upsert_session(&conn, "s2", "proj", Some("2024-06-15T00:00:00Z")).unwrap();
-        insert_message(&conn, "s1", Some("u1"), "user", "old session", None).unwrap();
-        insert_message(&conn, "s2", Some("u2"), "user", "new session", None).unwrap();
+    #[tokio::test]
+    async fn test_list_sessions_with_date_filter() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "proj", Some("2024-01-15T00:00:00Z"))
+            .await
+            .unwrap();
+        upsert_session(conn, "s2", "proj", Some("2024-06-15T00:00:00Z"))
+            .await
+            .unwrap();
+        insert_message(conn, "s1", Some("u1"), "user", "old session", None)
+            .await
+            .unwrap();
+        insert_message(conn, "s2", Some("u2"), "user", "new session", None)
+            .await
+            .unwrap();
 
-        let sessions = list_sessions(&conn, 100, None, Some("2024-03-01"), None).unwrap();
+        let sessions = list_sessions(conn, 100, None, Some("2024-03-01"), None)
+            .await
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s2");
 
-        let sessions = list_sessions(&conn, 100, None, None, Some("2024-03-01")).unwrap();
+        let sessions = list_sessions(conn, 100, None, None, Some("2024-03-01"))
+            .await
+            .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s1");
     }
 
-    #[test]
-    fn test_insert_without_uuid() {
-        let (conn, _tmp) = setup_db();
-        upsert_session(&conn, "s1", "proj", None).unwrap();
-        let inserted = insert_message(&conn, "s1", None, "user", "msg1", None).unwrap();
+    #[tokio::test]
+    async fn test_insert_without_uuid() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
+        upsert_session(conn, "s1", "proj", None).await.unwrap();
+        let inserted = insert_message(conn, "s1", None, "user", "msg1", None)
+            .await
+            .unwrap();
         assert!(inserted);
         // Without uuid, duplicate check is skipped, so second insert also succeeds
-        let inserted = insert_message(&conn, "s1", None, "user", "msg2", None).unwrap();
+        let inserted = insert_message(conn, "s1", None, "user", "msg2", None)
+            .await
+            .unwrap();
         assert!(inserted);
 
-        let (_, count) = stats(&conn).unwrap();
+        let (_, count) = stats(conn).await.unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_sync_disabled_on_local_vault() {
+        let (vault, _tmp) = setup_db().await;
+        assert!(!vault.sync_enabled());
+        assert!(vault.sync().await.is_err());
     }
 }
