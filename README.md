@@ -113,11 +113,11 @@ cd claude-vault
 # provisions the database through WSL; claude-vault itself runs natively)
 git clone https://github.com/kuroko1t/claude-vault.git
 cd claude-vault
-powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+pwsh -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 
 # Windows without WSL: builds the Turso CLI natively with Go, uses it just
 # for login and API-token minting, and provisions over the Platform REST API
-powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -NoWsl
+pwsh -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -NoWsl
 ```
 
 The scripts are idempotent (every step checks before it acts), so they're safe
@@ -281,7 +281,7 @@ auto-archive hooks:
 ```powershell
 # Windows (add -NoWsl to provision without WSL, via a Go-built Turso CLI
 # and the Platform REST API)
-powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+pwsh -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 ```
 
 Run it on each machine you want connected to the same vault. It's idempotent,
