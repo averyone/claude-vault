@@ -95,21 +95,30 @@ cargo install claude-vault
 cargo install --path .
 ```
 
-### macOS one-shot installer (with multi-device sync)
+### One-shot installers (with multi-device sync)
 
 If you want the full setup — toolchain, Turso CLI and database, environment
 variables, build, initial import, and Claude Code auto-archive hooks — run the
-bundled installer instead of the manual steps:
+bundled installer for your platform instead of the manual steps:
 
 ```bash
+# macOS
 git clone https://github.com/kuroko1t/claude-vault.git
 cd claude-vault
 ./scripts/install-mac.sh
 ```
 
-The script is idempotent (every step checks before it acts), so it's safe to
-re-run after a failure or to repair a partial setup. See
-[Multi-device sync](#multi-device-sync) for what it configures.
+```powershell
+# Windows (the Turso CLI has no native Windows support, so the script
+# provisions the database through WSL; claude-vault itself runs natively)
+git clone https://github.com/kuroko1t/claude-vault.git
+cd claude-vault
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+The scripts are idempotent (every step checks before it acts), so they're safe
+to re-run after a failure or to repair a partial setup. See
+[Multi-device sync](#multi-device-sync) for what they configure.
 
 ## Quick Start
 
@@ -253,19 +262,25 @@ Share one vault across machines using [libSQL embedded replicas](https://docs.tu
 
 > **Why not just put `vault.db` in iCloud/Dropbox?** File-sync services don't participate in SQLite's locking and sync the WAL files independently, which corrupts the database. Embedded replicas exist to solve exactly this.
 
-### Quick setup (macOS)
+### Quick setup (macOS / Windows)
 
-The bundled installer does everything in this section for you — installs the
-toolchain and Turso CLI, creates the database, sets the environment variables,
-builds claude-vault, imports your history, and wires up the Claude Code
+The bundled installers do everything in this section for you — install the
+toolchain and Turso CLI, create the database, set the environment variables,
+build claude-vault, import your history, and wire up the Claude Code
 auto-archive hooks:
 
 ```bash
+# macOS
 ./scripts/install-mac.sh
 ```
 
-Run it on each Mac you want connected to the same vault. It's idempotent, so
-re-running is always safe. The manual equivalent follows.
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+Run it on each machine you want connected to the same vault. It's idempotent,
+so re-running is always safe. The manual equivalent follows.
 
 ### Installing the Turso CLI
 
@@ -276,6 +291,9 @@ curl -sSfL https://get.tur.so/install.sh | bash
 
 # Linux
 curl -sSfL https://get.tur.so/install.sh | bash
+
+# Windows: no native support — run the same script inside WSL
+wsl -e sh -c 'curl -sSfL https://get.tur.so/install.sh | bash'
 ```
 
 Then create an account (or log in — same command either way; it opens a

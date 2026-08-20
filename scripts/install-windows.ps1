@@ -1,0 +1,265 @@
+# claude-vault Windows installer
+#
+# One-shot setup for claude-vault with multi-device sync (Turso):
+# toolchain (MSVC Build Tools, rustup, cargo), Turso CLI + database,
+# environment variables, build/install, initial import, and Claude Code
+# hook wiring.
+#
+# Platform notes (differences from install-mac.sh):
+#   - MSVC Build Tools replace the Xcode Command Line Tools.
+#   - The Turso CLI has no native Windows support; per Turso's docs it runs
+#     under WSL. WSL is only needed for this one-time provisioning (login,
+#     database creation, token minting) — claude-vault itself builds and
+#     syncs natively on Windows.
+#   - Environment variables are persisted per-user via the registry instead
+#     of ~/.zshrc.
+#   - settings.json is edited with PowerShell instead of python3.
+#
+# Safe to re-run: every step checks before it acts.
+#
+# Usage:  powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+
+$ErrorActionPreference = 'Stop'
+# wsl.exe emits its own messages as UTF-16; this makes them UTF-8 so
+# captured output is comparable as normal strings.
+$env:WSL_UTF8 = '1'
+
+$DbName = 'claude-vault'
+$ClaudeDir = Join-Path $env:USERPROFILE '.claude'
+$ClaudeSettings = Join-Path $ClaudeDir 'settings.json'
+# Rust's dirs::data_dir() resolves to roaming AppData on Windows
+$VaultDb = Join-Path $env:APPDATA 'claude-vault\vault.db'
+# Repo root = parent of this script's directory
+$RepoDir = Split-Path -Parent $PSScriptRoot
+
+function Show-Banner([string]$Title) {
+  Write-Host ''
+  Write-Host ('=' * 68)
+  Write-Host "<<$Title>>"
+  Write-Host ('=' * 68)
+}
+
+function Assert-LastExitCode([string]$What) {
+  if ($LASTEXITCODE -ne 0) {
+    Write-Error "$What failed (exit code $LASTEXITCODE)."
+  }
+}
+
+# All turso commands run inside WSL, where the CLI is supported.
+function Invoke-Turso([string]$TursoArgs) {
+  wsl -e sh -c ('PATH="$HOME/.turso:$PATH" turso ' + $TursoArgs)
+}
+
+# The turso CLI exits 0 even when logged out, printing an error to stdout,
+# so login state must be detected from the output, not the exit code.
+function Test-TursoLoggedIn {
+  $who = (Invoke-Turso 'auth whoami' 2>$null) -join ' '
+  return ($who -and $who -notmatch 'not logged in')
+}
+
+if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+  Write-Error "winget is required (ships with Windows 10/11 as 'App Installer'). Install it from the Microsoft Store, then re-run this script."
+}
+
+Show-Banner 'STEP 1: INSTALL MSVC BUILD TOOLS'
+# Equivalent of the Xcode Command Line Tools: the MSVC linker and Windows SDK
+# that rust's default x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
+# toolchain needs. Detected via vswhere, which ships with any VS installer.
+$VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$HaveVcTools = (Test-Path $VsWhere) -and
+  ((& $VsWhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) -join '')
+if ($HaveVcTools) {
+  Write-Host "MSVC Build Tools already installed at: $HaveVcTools"
+} else {
+  Write-Host 'MSVC Build Tools not found. Installing via winget (this can take a while)...'
+  winget install --id Microsoft.VisualStudio.2022.BuildTools -e `
+    --accept-package-agreements --accept-source-agreements `
+    --override '--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+  Assert-LastExitCode 'MSVC Build Tools installation'
+  Write-Host ''
+  Write-Host 'Build tools installed. Open a NEW terminal and RE-RUN this script.'
+  exit 1
+}
+
+Show-Banner 'STEP 2: INSTALL RUSTUP'
+if (Get-Command rustup -ErrorAction SilentlyContinue) {
+  Write-Host "rustup already installed: $((rustup --version 2>$null | Select-Object -First 1))"
+} else {
+  Write-Host 'rustup not found. Installing via winget...'
+  winget install --id Rustlang.Rustup -e --accept-package-agreements --accept-source-agreements
+  Assert-LastExitCode 'rustup installation'
+}
+# Make cargo/rustup available to this session (new shells get it from the
+# PATH entry the rustup installer registers).
+$CargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+if ($env:Path -notlike "*$CargoBin*") {
+  $env:Path = "$CargoBin;$env:Path"
+  Write-Host "Added $CargoBin to PATH for this session."
+}
+
+Show-Banner 'STEP 3: VERIFY CARGO'
+if (Get-Command cargo -ErrorAction SilentlyContinue) {
+  Write-Host "cargo already installed: $(cargo --version)"
+} else {
+  Write-Host 'cargo not found. Installing the stable toolchain via rustup...'
+  rustup toolchain install stable
+  rustup default stable
+  Write-Host "cargo installed: $(cargo --version)"
+}
+
+Show-Banner 'STEP 4: INSTALL TURSO CLI (VIA WSL)'
+# Turso's CLI does not support native Windows; the documented path is WSL.
+wsl -e sh -c 'exit 0' 2>$null
+if ($LASTEXITCODE -ne 0) {
+  Write-Host 'WSL is not ready. Installing it (requires admin; a reboot may be needed)...'
+  wsl --install
+  Write-Host ''
+  Write-Host 'After WSL setup (and a reboot if prompted), RE-RUN this script.'
+  exit 1
+}
+$TursoPath = (wsl -e sh -c 'PATH="$HOME/.turso:$PATH" command -v turso' 2>$null) -join ''
+if ($TursoPath) {
+  Write-Host "turso already installed in WSL: $TursoPath"
+} else {
+  Write-Host 'turso not found in WSL. Installing via get.tur.so...'
+  wsl -e sh -c 'curl -sSfL https://get.tur.so/install.sh | bash'
+  Assert-LastExitCode 'Turso CLI installation'
+}
+if (Test-TursoLoggedIn) {
+  Write-Host "Already logged in to Turso as: $(Invoke-Turso 'auth whoami')"
+} else {
+  Write-Host 'Not logged in to Turso. Starting signup (follow the URL it prints;'
+  Write-Host 'if you already have an account this simply logs you in)...'
+  Invoke-Turso 'auth signup'
+  if (-not (Test-TursoLoggedIn)) {
+    Write-Error "Turso login did not complete. Run 'wsl turso auth login' and re-run this script."
+  }
+}
+
+Show-Banner "STEP 5: FIND OR CREATE THE '$DbName' DATABASE"
+$ExistingUrl = (Invoke-Turso "db show $DbName --url" 2>$null) -join ''
+if ($ExistingUrl -like 'libsql://*') {
+  Write-Host "Database '$DbName' already exists."
+} else {
+  Write-Host "Database '$DbName' not found. Creating it..."
+  Invoke-Turso "db create $DbName"
+  Assert-LastExitCode 'Database creation'
+}
+
+Show-Banner 'STEP 6: SET SYNC ENVIRONMENT VARIABLES (USER SCOPE)'
+$SyncUrl = (Invoke-Turso "db show $DbName --url") -join ''
+if ($SyncUrl -notlike 'libsql://*') {
+  Write-Error "Expected a libsql:// URL from 'turso db show', got: $SyncUrl"
+}
+$AuthToken = (Invoke-Turso "db tokens create $DbName") -join ''
+if (-not $AuthToken -or $AuthToken -match ' ') {
+  Write-Error "'turso db tokens create' did not return a token, got: $AuthToken"
+}
+Write-Host "Sync URL: $SyncUrl"
+Write-Host "Minted a fresh auth token ($($AuthToken.Length) chars)."
+# Persist for future shells (registry, user scope) and export to this session
+[Environment]::SetEnvironmentVariable('CLAUDE_VAULT_SYNC_URL', $SyncUrl, 'User')
+[Environment]::SetEnvironmentVariable('CLAUDE_VAULT_AUTH_TOKEN', $AuthToken, 'User')
+$env:CLAUDE_VAULT_SYNC_URL = $SyncUrl
+$env:CLAUDE_VAULT_AUTH_TOKEN = $AuthToken
+Write-Host 'Wrote CLAUDE_VAULT_SYNC_URL and CLAUDE_VAULT_AUTH_TOKEN to the user environment.'
+
+Show-Banner 'STEP 7: REMOVE ANY PREVIOUSLY INSTALLED CLAUDE-VAULT'
+cargo uninstall claude-vault 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) {
+  Write-Host 'Uninstalled previous claude-vault binary.'
+} else {
+  Write-Host 'No previously installed claude-vault binary (nothing to uninstall).'
+}
+
+Show-Banner 'STEP 8: BUILD AND INSTALL CLAUDE-VAULT'
+Write-Host "Running cargo install --path $RepoDir (this can take a few minutes)..."
+cargo install --path $RepoDir
+Assert-LastExitCode 'cargo install'
+Write-Host "Installed: $((Get-Command claude-vault).Source) ($(claude-vault --version))"
+
+Show-Banner 'STEP 9: IMPORT CONVERSATION HISTORY INTO THE SYNCED VAULT'
+# A database created by an older (local-only) claude-vault is a plain SQLite
+# file; sync mode must build its embedded-replica file fresh from the server.
+# Move any such file aside — its contents are re-imported from ~/.claude below,
+# and UUID dedup makes that safe.
+if ((Test-Path $VaultDb) -and -not (Test-Path "$VaultDb-info")) {
+  $Backup = "$VaultDb.pre-sync-$(Get-Date -Format yyyyMMddHHmmss).bak"
+  Write-Host 'Existing local (non-replica) database found. Moving it aside:'
+  Write-Host "  $VaultDb -> $Backup"
+  Move-Item $VaultDb $Backup
+  Remove-Item -ErrorAction SilentlyContinue "$VaultDb-wal", "$VaultDb-shm"
+}
+Write-Host 'Importing from ~/.claude/projects (first sync run may take a while)...'
+claude-vault import
+Assert-LastExitCode 'claude-vault import'
+claude-vault stats
+
+Show-Banner 'STEP 10 & 11: WIRE SYNC INTO CLAUDE CODE SETTINGS'
+New-Item -ItemType Directory -Force -Path $ClaudeDir | Out-Null
+$Settings = [pscustomobject]@{}
+if (Test-Path $ClaudeSettings) {
+  Copy-Item $ClaudeSettings "$ClaudeSettings.bak-$(Get-Date -Format yyyyMMddHHmmss)"
+  Write-Host 'Backed up existing settings.json.'
+  $Settings = Get-Content -Raw $ClaudeSettings | ConvertFrom-Json
+}
+
+# Step 10: env vars for Claude Code sessions (hooks inherit these too)
+if (-not $Settings.PSObject.Properties['env']) {
+  $Settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{})
+}
+$Settings.env | Add-Member -Force -NotePropertyName CLAUDE_VAULT_SYNC_URL -NotePropertyValue $SyncUrl
+$Settings.env | Add-Member -Force -NotePropertyName CLAUDE_VAULT_AUTH_TOKEN -NotePropertyValue $AuthToken
+Write-Host 'Set env.CLAUDE_VAULT_SYNC_URL and env.CLAUDE_VAULT_AUTH_TOKEN'
+
+# Step 11: auto-archive hooks with sync flags inlined. Hook commands run
+# through cmd.exe on Windows, hence >NUL and no trailing '&' (cmd has no
+# background operator; SessionEnd runs synchronously here).
+$Flags = "--sync-url `"$SyncUrl`" --auth-token `"$AuthToken`""
+$Desired = [ordered]@{
+  PreCompact = "claude-vault $Flags import >NUL 2>&1"
+  SessionEnd = "claude-vault $Flags import >NUL 2>&1"
+}
+if (-not $Settings.PSObject.Properties['hooks']) {
+  $Settings | Add-Member -NotePropertyName hooks -NotePropertyValue ([pscustomobject]@{})
+}
+foreach ($Event in $Desired.Keys) {
+  $Command = $Desired[$Event]
+  $Entries = @()
+  if ($Settings.hooks.PSObject.Properties[$Event]) {
+    $Entries = @($Settings.hooks.$Event)
+  }
+  $Updated = $false
+  foreach ($Entry in $Entries) {
+    foreach ($Hook in @($Entry.hooks)) {
+      $Cmd = [string]$Hook.command
+      if ($Hook.type -eq 'command' -and $Cmd.TrimStart().StartsWith('claude-vault') -and $Cmd -match 'import') {
+        $Hook.command = $Command
+        $Updated = $true
+        break
+      }
+    }
+    if ($Updated) { break }
+  }
+  if ($Updated) {
+    Write-Host "Updated existing $Event hook to include sync flags"
+  } else {
+    $Entries += [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $Command }) }
+    Write-Host "Added $Event auto-archive hook with sync flags"
+  }
+  $Settings.hooks | Add-Member -Force -NotePropertyName $Event -NotePropertyValue $Entries
+}
+ConvertTo-Json -InputObject $Settings -Depth 32 | Set-Content -Encoding UTF8 $ClaudeSettings
+Write-Host "Wrote $ClaudeSettings"
+
+Show-Banner 'DONE'
+Write-Host 'claude-vault is installed with multi-device sync enabled.'
+Write-Host ''
+Write-Host "  Binary:    $((Get-Command claude-vault).Source)"
+Write-Host "  Database:  $VaultDb (embedded replica)"
+Write-Host "  Sync URL:  $SyncUrl"
+Write-Host ''
+Write-Host 'Open a new terminal to pick up the environment variables. Claude Code'
+Write-Host 'sessions started from now on archive to the shared vault automatically.'
+Write-Host 'Run this script (or install-mac.sh on a Mac) on any other machine to'
+Write-Host 'connect it to the same vault.'
