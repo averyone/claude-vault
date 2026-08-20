@@ -73,16 +73,27 @@ else
   curl -sSfL https://get.tur.so/install.sh | bash
   export PATH="$HOME/.turso:$PATH"
 fi
-if turso auth whoami >/dev/null 2>&1; then
+# The turso CLI exits 0 even when logged out, printing an error to stdout,
+# so login state must be detected from the output, not the exit code.
+turso_logged_in() {
+  local who
+  who="$(turso auth whoami 2>/dev/null)"
+  [[ -n "$who" && "$who" != *"not logged in"* ]]
+}
+if turso_logged_in; then
   echo "Already logged in to Turso as: $(turso auth whoami)"
 else
   echo "Not logged in to Turso. Starting signup (a browser window will open;"
   echo "if you already have an account this simply logs you in)..."
   turso auth signup
+  if ! turso_logged_in; then
+    echo "ERROR: Turso login did not complete. Run 'turso auth login' and re-run this script." >&2
+    exit 1
+  fi
 fi
 
 banner "STEP 5: FIND OR CREATE THE '$DB_NAME' DATABASE"
-if turso db show "$DB_NAME" --url >/dev/null 2>&1; then
+if turso db show "$DB_NAME" --url 2>/dev/null | grep -q '^libsql://'; then
   echo "Database '$DB_NAME' already exists."
 else
   echo "Database '$DB_NAME' not found. Creating it..."
@@ -91,7 +102,15 @@ fi
 
 banner "STEP 6: SET SYNC ENVIRONMENT VARIABLES IN ~/.zshrc"
 SYNC_URL="$(turso db show "$DB_NAME" --url)"
+if [[ "$SYNC_URL" != libsql://* ]]; then
+  echo "ERROR: expected a libsql:// URL from 'turso db show', got: $SYNC_URL" >&2
+  exit 1
+fi
 AUTH_TOKEN="$(turso db tokens create "$DB_NAME")"
+if [[ -z "$AUTH_TOKEN" || "$AUTH_TOKEN" == *" "* ]]; then
+  echo "ERROR: 'turso db tokens create' did not return a token, got: $AUTH_TOKEN" >&2
+  exit 1
+fi
 echo "Sync URL: $SYNC_URL"
 echo "Minted a fresh auth token (${#AUTH_TOKEN} chars)."
 # Replace any existing entries, then append the current values
