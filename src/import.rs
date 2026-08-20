@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use libsql::Connection;
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -124,7 +124,11 @@ fn is_noise(content: &str) -> bool {
     false
 }
 
-pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Result<ImportStats> {
+pub async fn import_jsonl_file(
+    conn: &Connection,
+    path: &Path,
+    project: &str,
+) -> Result<ImportStats> {
     let file =
         fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -132,6 +136,16 @@ pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Resul
     let mut stats = ImportStats::default();
     let mut session_id: Option<String> = None;
     let mut first_timestamp: Option<String> = None;
+    // Track session upserts so we run one per file (plus one more if the
+    // timestamp arrives later), instead of one per message. In sync mode
+    // every statement is a round trip to the remote primary.
+    let mut session_upserted = false;
+    let mut upserted_with_ts = false;
+
+    // One transaction per file: a single commit round trip in sync mode,
+    // and the file's messages land atomically. Dropping the transaction on
+    // error rolls back, and re-import is safe thanks to UUID deduplication.
+    let tx = conn.transaction().await?;
 
     for line in reader.lines() {
         let line = line?;
@@ -209,9 +223,13 @@ pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Resul
                     }
                 };
 
-                db::upsert_session(conn, sid, project, first_timestamp.as_deref())?;
+                if !session_upserted || (!upserted_with_ts && first_timestamp.is_some()) {
+                    db::upsert_session(&tx, sid, project, first_timestamp.as_deref()).await?;
+                    session_upserted = true;
+                    upserted_with_ts = first_timestamp.is_some();
+                }
 
-                if db::insert_message(conn, sid, uuid, role, &content, timestamp)? {
+                if db::insert_message(&tx, sid, uuid, role, &content, timestamp).await? {
                     stats.imported += 1;
                 } else {
                     stats.skipped += 1;
@@ -222,6 +240,8 @@ pub fn import_jsonl_file(conn: &Connection, path: &Path, project: &str) -> Resul
             }
         }
     }
+
+    tx.commit().await?;
 
     Ok(stats)
 }
@@ -276,7 +296,7 @@ fn collect_jsonl_files(
     Ok(())
 }
 
-pub fn import_all(conn: &Connection, claude_dir: &Path) -> Result<ImportStats> {
+pub async fn import_all(conn: &Connection, claude_dir: &Path) -> Result<ImportStats> {
     let files = discover_jsonl_files(claude_dir)?;
     let mut total = ImportStats::default();
 
@@ -285,7 +305,7 @@ pub fn import_all(conn: &Connection, claude_dir: &Path) -> Result<ImportStats> {
         if file_count > 10 && (i + 1) % 10 == 0 {
             eprint!("\rProcessing {}/{} files...", i + 1, file_count);
         }
-        match import_jsonl_file(conn, path, project) {
+        match import_jsonl_file(conn, path, project).await {
             Ok(stats) => {
                 total.imported += stats.imported;
                 total.skipped += stats.skipped;
@@ -320,10 +340,12 @@ mod tests {
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
 
-    fn setup_db() -> (Connection, NamedTempFile) {
-        let tmp = NamedTempFile::new().unwrap();
-        let conn = db::open_db(tmp.path()).unwrap();
-        (conn, tmp)
+    async fn setup_db() -> (db::Vault, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let vault = db::open_vault(&tmp.path().join("test.db"), None)
+            .await
+            .unwrap();
+        (vault, tmp)
     }
 
     #[test]
@@ -341,9 +363,10 @@ mod tests {
         assert_eq!(extract_text_content(&v), Some("hello\nworld".into()));
     }
 
-    #[test]
-    fn test_import_jsonl_file() {
-        let (conn, _tmp) = setup_db();
+    #[tokio::test]
+    async fn test_import_jsonl_file() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
 
         let mut jsonl = NamedTempFile::new().unwrap();
         writeln!(jsonl, r#"{{"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2024-01-01T00:00:00Z","message":{{"role":"user","content":"hello world"}}}}"#).unwrap();
@@ -354,25 +377,28 @@ mod tests {
         )
         .unwrap();
 
-        let stats = import_jsonl_file(&conn, jsonl.path(), "test-project").unwrap();
+        let stats = import_jsonl_file(conn, jsonl.path(), "test-project")
+            .await
+            .unwrap();
         assert_eq!(stats.imported, 2);
         assert_eq!(stats.skipped, 0);
         assert_eq!(stats.errors, 0);
 
-        let (sessions, messages) = db::stats(&conn).unwrap();
+        let (sessions, messages) = db::stats(conn).await.unwrap();
         assert_eq!(sessions, 1);
         assert_eq!(messages, 2);
     }
 
-    #[test]
-    fn test_import_skips_duplicates() {
-        let (conn, _tmp) = setup_db();
+    #[tokio::test]
+    async fn test_import_skips_duplicates() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
 
         let mut jsonl = NamedTempFile::new().unwrap();
         writeln!(jsonl, r#"{{"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2024-01-01T00:00:00Z","message":{{"role":"user","content":"hello"}}}}"#).unwrap();
 
-        import_jsonl_file(&conn, jsonl.path(), "proj").unwrap();
-        let stats = import_jsonl_file(&conn, jsonl.path(), "proj").unwrap();
+        import_jsonl_file(conn, jsonl.path(), "proj").await.unwrap();
+        let stats = import_jsonl_file(conn, jsonl.path(), "proj").await.unwrap();
         assert_eq!(stats.imported, 0);
         assert_eq!(stats.skipped, 1);
     }
@@ -471,9 +497,10 @@ mod tests {
         assert!(cleaned.trim().is_empty());
     }
 
-    #[test]
-    fn test_import_empty_content_skipped() {
-        let (conn, _tmp) = setup_db();
+    #[tokio::test]
+    async fn test_import_empty_content_skipped() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
 
         let mut jsonl = NamedTempFile::new().unwrap();
         writeln!(
@@ -482,13 +509,14 @@ mod tests {
         )
         .unwrap();
 
-        let stats = import_jsonl_file(&conn, jsonl.path(), "proj").unwrap();
+        let stats = import_jsonl_file(conn, jsonl.path(), "proj").await.unwrap();
         assert_eq!(stats.imported, 0);
     }
 
-    #[test]
-    fn test_import_filters_system_reminder() {
-        let (conn, _tmp) = setup_db();
+    #[tokio::test]
+    async fn test_import_filters_system_reminder() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
 
         let mut jsonl = NamedTempFile::new().unwrap();
         // Message that is purely a system-reminder
@@ -504,18 +532,21 @@ mod tests {
         )
         .unwrap();
 
-        let stats = import_jsonl_file(&conn, jsonl.path(), "proj").unwrap();
+        let stats = import_jsonl_file(conn, jsonl.path(), "proj").await.unwrap();
         assert_eq!(stats.imported, 1); // Only the one with real content
         assert_eq!(stats.filtered, 1); // The pure system-reminder was filtered
 
-        let results = db::search(&conn, "real", 10, None, None, None, None).unwrap();
+        let results = db::search(conn, "real", 10, None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].content.contains("system-reminder"));
     }
 
-    #[test]
-    fn test_import_no_uuid() {
-        let (conn, _tmp) = setup_db();
+    #[tokio::test]
+    async fn test_import_no_uuid() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
 
         let mut jsonl = NamedTempFile::new().unwrap();
         writeln!(
@@ -524,16 +555,19 @@ mod tests {
         )
         .unwrap();
 
-        let stats = import_jsonl_file(&conn, jsonl.path(), "proj").unwrap();
+        let stats = import_jsonl_file(conn, jsonl.path(), "proj").await.unwrap();
         assert_eq!(stats.imported, 1);
 
-        let results = db::search(&conn, "uuid", 10, None, None, None, None).unwrap();
+        let results = db::search(conn, "uuid", 10, None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
-    #[test]
-    fn test_import_malformed_json() {
-        let (conn, _tmp) = setup_db();
+    #[tokio::test]
+    async fn test_import_malformed_json() {
+        let (vault, _tmp) = setup_db().await;
+        let conn = &vault.conn;
 
         let mut jsonl = NamedTempFile::new().unwrap();
         writeln!(jsonl, "not valid json").unwrap();
@@ -543,7 +577,7 @@ mod tests {
         )
         .unwrap();
 
-        let stats = import_jsonl_file(&conn, jsonl.path(), "proj").unwrap();
+        let stats = import_jsonl_file(conn, jsonl.path(), "proj").await.unwrap();
         assert_eq!(stats.imported, 1);
         assert_eq!(stats.errors, 1);
     }

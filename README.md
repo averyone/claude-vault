@@ -60,6 +60,7 @@ Messages: 94562
 ## Features
 
 - **FTS5 full-text search** with Porter stemming (e.g. "running" matches "run")
+- **Multi-device sync** (optional) — share one vault across machines via libSQL embedded replicas (Turso or self-hosted sqld)
 - **Automatic archiving** via Claude Code hooks (PreCompact + SessionEnd)
 - **Noise filtering** — strips tool results, system tags, and meta messages
 - **UUID deduplication** — safe to re-import; duplicates are skipped
@@ -185,6 +186,7 @@ claude-vault list --json
 claude-vault delete 47cf -y                        # delete a session
 claude-vault stats                                  # show database statistics
 claude-vault verify                                 # check database integrity
+claude-vault sync                                   # pull latest from sync server (see Multi-device sync)
 claude-vault completions zsh > ~/.zfunc/_claude-vault  # shell completions
 claude-vault --db /path/to/vault.db search "query"  # custom database path
 ```
@@ -228,6 +230,48 @@ Add to `~/.claude/settings.json`:
 | **SessionEnd** | When a session ends | Background — non-blocking |
 
 Once configured, conversations are archived automatically with no manual steps.
+
+## Multi-device sync
+
+Share one vault across machines using [libSQL embedded replicas](https://docs.turso.tech/features/embedded-replicas/introduction). Each machine keeps a full local copy of the database — reads and searches stay local and fast — while writes are forwarded to a sync server and replicated to every device.
+
+> **Why not just put `vault.db` in iCloud/Dropbox?** File-sync services don't participate in SQLite's locking and sync the WAL files independently, which corrupts the database. Embedded replicas exist to solve exactly this.
+
+### Setup with Turso
+
+```bash
+# One-time: create a database and get credentials
+turso db create claude-vault
+turso db show claude-vault --url        # -> libsql://claude-vault-<org>.turso.io
+turso db tokens create claude-vault     # -> auth token
+
+# On every machine (e.g. in ~/.zshrc):
+export CLAUDE_VAULT_SYNC_URL="libsql://claude-vault-<org>.turso.io"
+export CLAUDE_VAULT_AUTH_TOKEN="<token>"
+```
+
+That's it — all commands now operate on the synced database:
+
+```bash
+claude-vault import          # archives to the shared vault
+claude-vault search "..."    # searches history from ALL machines
+claude-vault sync            # manually pull the latest remote state
+```
+
+The flags `--sync-url` and `--auth-token` work as one-off alternatives to the environment variables. A self-hosted [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) server works the same way (`--sync-url http://your-server:8080`; token optional depending on your server config).
+
+### Sync behavior
+
+| Operation | Behavior |
+|-----------|----------|
+| Reads (search, list, export) | Always local — served from the on-disk replica |
+| Writes (import, delete) | Forwarded to the sync server, then reflected locally |
+| On startup | Pulls the latest remote state; falls back to the local replica with a warning if offline |
+| Offline | Reads work (possibly stale); writes require connectivity |
+
+If you use the [auto-archive hooks](#auto-archive-with-claude-code-hooks), export the two environment variables somewhere the hook commands can see them (or add the flags to the hook commands directly), and every machine archives into the same vault. UUID deduplication makes concurrent imports from multiple machines safe.
+
+Migrating an existing local vault: run `claude-vault import` once with sync enabled and your `~/.claude/projects` history is re-imported into the shared database. Sessions whose JSONL files are already gone can be carried over by exporting/re-importing, or just start the shared vault fresh from the machine with the most complete local database (copy that `vault.db` aside, then `turso db create claude-vault --from-file vault.db`).
 
 <details>
 <summary><h2>How It Works</h2></summary>
@@ -289,7 +333,7 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 
 Default database location: `~/.local/share/claude-vault/vault.db`
 
-SQLite is configured with WAL mode and a 5-second busy timeout for safe concurrent access.
+In local mode, SQLite is configured with WAL mode and a 5-second busy timeout for safe concurrent access. In sync mode, the file is a libSQL embedded replica managed by the sync protocol.
 
 </details>
 
