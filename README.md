@@ -48,6 +48,18 @@ Run the following on the host:
   docker compose -f docker-compose.safe.yml build --no-cache
 ```
 
+### Revive a session
+
+```
+$ cd ~/src/my-project
+$ claude-vault revive 47cf1f2e
+Revived 47cf1f2e-9a3b-4c81-b0d2-5e7f1a2c8d40 (86 turns) into
+  /home/user/.claude/projects/-home-user-src-my-project/9f3c1d20-4b7a-42e1-8c95-3d6f0b1e7a24.jsonl
+Resume: claude --resume 9f3c1d20-4b7a-42e1-8c95-3d6f0b1e7a24
+```
+
+The session is now a normal Claude Code session — pick it up with `claude --resume`, or select it from `/resume`, and keep going.
+
 ### Database stats
 
 ```
@@ -146,7 +158,15 @@ claude-vault search "error handling"
 claude-vault list
 ```
 
-4. (Optional) Set up auto-archiving — see [Hooks Setup](#auto-archive-with-claude-code-hooks).
+4. Bring one back to life and keep working on it:
+
+```bash
+cd ~/src/my-project
+claude-vault revive --last
+# Resume: claude --resume 9f3c1d20-...
+```
+
+5. (Optional) Set up auto-archiving — see [Hooks Setup](#auto-archive-with-claude-code-hooks).
 
 ## Using from Claude Code
 
@@ -161,7 +181,14 @@ claude-vault search "auth bug" --json
 claude-vault list --json
 ```
 
-With [auto-archiving hooks](#auto-archive-with-claude-code-hooks) configured, Claude Code can always search your full history — even for sessions whose JSONL files have been deleted.
+Or pull a whole conversation back into Claude Code and carry on with it:
+
+```bash
+claude-vault revive 47cf1f2e     # file it under the current directory
+claude --resume <printed-id>     # ...and continue where it left off
+```
+
+With [auto-archiving hooks](#auto-archive-with-claude-code-hooks) configured, Claude Code can always search your full history — even for sessions whose JSONL files have been deleted. `revive` is what closes the loop: a session the vault outlived can become a live session again.
 
 <details>
 <summary><h2>Usage</h2></summary>
@@ -190,6 +217,9 @@ claude-vault search "deploy" --project my-app
 claude-vault search "deploy" --since 2024-01-01 --until 2024-06-30
 claude-vault search '"error handling" AND rust'   # FTS5 syntax
 claude-vault search "auth bug" --json              # machine-readable output
+claude-vault search "retry" --role assistant       # only assistant messages
+claude-vault search "retry" --limit 50             # default is 10
+claude-vault search "cargo build" --include-tools  # show tool_use lines too
 ```
 
 ### export
@@ -199,30 +229,56 @@ Export a session to Markdown, JSON, or plain text. Accepts session ID prefixes (
 ```bash
 claude-vault export 47cf1f2e
 claude-vault export --last                          # most recent session
+claude-vault export --last 2                        # second most recent
 claude-vault export --last --format markdown > session.md
+claude-vault export 47cf1f2e --format json          # structured output
+claude-vault export 47cf1f2e --format text          # flat plain text
 ```
+
+`export` gives you the conversation as a document. To get it back into Claude Code as a session you can continue, use [`revive`](#revive) instead.
 
 ### revive
 
-Write an archived session back into `~/.claude/projects/` as a JSONL transcript so you can pick the conversation up in Claude Code and keep going. The session is filed under the directory you run the command from:
+Write an archived session back into `~/.claude/projects/` as a JSONL transcript, so you can pick the conversation up in Claude Code and keep going. This is the inverse of `import`: where `import` pulls sessions off disk into the vault, `revive` puts one back.
+
+The session is filed under the directory you run the command from — that directory is what Claude Code uses to decide which project a session belongs to:
 
 ```bash
 cd ~/src/my-repo
-claude-vault revive 47cf1f2e     # revive a specific session here
-claude-vault revive --last       # revive the most recent session
+claude-vault revive 47cf1f2e          # revive a specific session here
+claude-vault revive --last            # the most recent session
+claude-vault revive --last 3          # the third most recent
+claude-vault revive 47cf --include-tools   # keep tool calls as text
+claude-vault revive 47cf --cwd ~/src/other-repo   # file it elsewhere
 ```
 
 ```
-Revived 47cf1f2e-... (86 turns) into /Users/me/.claude/projects/-Users-me-src-my-repo/9f3c1d20-....jsonl
-Resume: claude --resume 9f3c1d20-...
+Revived 47cf1f2e-9a3b-4c81-b0d2-5e7f1a2c8d40 (86 turns) into
+  /home/user/.claude/projects/-home-user-src-my-repo/9f3c1d20-4b7a-42e1-8c95-3d6f0b1e7a24.jsonl
+Resume: claude --resume 9f3c1d20-4b7a-42e1-8c95-3d6f0b1e7a24
 ```
 
-Notes:
+Then continue the conversation:
 
-- The revived session always gets a **fresh** ID, so it can never overwrite a session Claude Code already has on disk. The original stays in the vault untouched.
-- Tool calls are dropped by default, since the archive stores them without their results. Pass `--include-tools` to keep them as text.
-- Consecutive same-role messages are joined into one turn, so the revived file is a well-formed alternating conversation.
-- Use `--cwd` to file the session under a different directory than the one you are in.
+```bash
+claude --resume 9f3c1d20-4b7a-42e1-8c95-3d6f0b1e7a24
+```
+
+It also shows up in `/resume` inside Claude Code, listed under the project directory you revived it into.
+
+#### What the revived transcript contains
+
+The vault stores cleaned message text, not the full raw session, so a revived transcript is a faithful record of the *conversation* rather than a byte-for-byte copy of the original file. Specifically:
+
+| Aspect | Behavior |
+|--------|----------|
+| Session ID | Always **fresh**, so reviving can never overwrite a session Claude Code already has on disk. The vault copy is untouched, and you can revive the same session more than once. |
+| Tool calls | Archived without their results, so they're dropped by default — a tool call with no result is not a valid thing to replay. `--include-tools` keeps them as plain text. |
+| Turns | Consecutive same-role messages are joined into one turn (and any assistant turns before the first user turn are dropped), so the file is a well-formed alternating conversation. This means the turn count is usually lower than the archived message count. |
+| Metadata | `cwd` comes from the target directory; `gitBranch` and Claude Code `version` are detected best-effort and omitted if unavailable. Assistant turns are marked with Claude Code's `<synthetic>` model marker, the same one it uses for messages it injects itself. |
+| Timestamps | Preserved from the original messages. |
+
+Because tool calls and their results are gone, a revived session has the conversation history but not the original tool output. Claude re-reads files and re-runs commands as needed when you continue.
 
 ### list
 
@@ -367,7 +423,7 @@ The flags `--sync-url` and `--auth-token` work as one-off alternatives to the en
 
 | Operation | Behavior |
 |-----------|----------|
-| Reads (search, list, export) | Always local — served from the on-disk replica |
+| Reads (search, list, export, revive) | Always local — served from the on-disk replica |
 | Writes (import, delete) | Forwarded to the sync server, then reflected locally |
 | On startup | Pulls the latest remote state; falls back to the local replica with a warning if offline |
 | Offline | Reads work (possibly stale); writes require connectivity |
@@ -387,18 +443,23 @@ Migrating an existing local vault: a database created in local mode is a plain S
     │  Parse   │────▶│  Filter  │────▶│  SQLite   │
     │  JSONL   │     │  & Clean │     │  + FTS5   │
     └─────────┘     └──────────┘     └───────────┘
+                                           │
+                                  revive   │
+    ~/.claude/projects/<cwd>/  ◀───────────┘
+      <new-session>.jsonl
 ```
 
 1. **Parse** — Reads each JSONL record, extracts `user` and `assistant` messages
 2. **Filter** — Removes system-injected noise (see below)
 3. **Store** — Inserts into SQLite with UUID-based dedup; FTS5 index is updated via triggers
+4. **Revive** (optional) — Rebuilds a stored session as a Claude Code transcript under a chosen directory, so it can be resumed and continued
 
 ### Noise Filtering
 
 | Category | What's removed |
 |----------|---------------|
 | Tool results | All `tool_result` content (Bash output, file creation messages, web fetch results, etc.) |
-| System tags | `<system-reminder>`, `<local-command-caveat>`, `<local-command-stdout>`, `<command-name>`, `<command-message>`, `<command-args>` |
+| System tags | `<system-reminder>`, `<local-command-caveat>`, `<local-command-stdout>`, `<command-name>`, `<command-message>`, `<command-args>`, `<task-notification>` |
 | Read-only tools | Read, Glob, Grep, LSP, ToolSearch, browser snapshot/navigation, TaskGet/TaskOutput/TaskList |
 | Meta messages | eval-loop iterations/commands, Stop hook feedback, empty/whitespace-only content |
 
@@ -434,7 +495,15 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 );
 ```
 
-Default database location: `~/.local/share/claude-vault/vault.db`
+Default database location (platform-specific, via the OS data directory):
+
+| Platform | Path |
+|----------|------|
+| Linux | `$XDG_DATA_HOME/claude-vault/vault.db` (usually `~/.local/share/...`) |
+| macOS | `~/Library/Application Support/claude-vault/vault.db` |
+| Windows | `%APPDATA%\claude-vault\vault.db` |
+
+Override it with `--db <path>` or the `CLAUDE_VAULT_DB` environment variable.
 
 In local mode, SQLite is configured with WAL mode and a 5-second busy timeout for safe concurrent access. In sync mode, the file is a libSQL embedded replica managed by the sync protocol.
 
