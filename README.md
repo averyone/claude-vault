@@ -65,6 +65,7 @@ Messages: 94562
 - **Noise filtering** — strips tool results, system tags, and meta messages
 - **UUID deduplication** — safe to re-import; duplicates are skipped
 - **Session export** — Markdown, JSON, or plain text
+- **Session revive** — write an archived session back to disk as a resumable Claude Code transcript
 - **Single binary** — no Python, Node.js, or other runtime required
 
 ## Install
@@ -200,6 +201,28 @@ claude-vault export 47cf1f2e
 claude-vault export --last                          # most recent session
 claude-vault export --last --format markdown > session.md
 ```
+
+### revive
+
+Write an archived session back into `~/.claude/projects/` as a JSONL transcript so you can pick the conversation up in Claude Code and keep going. The session is filed under the directory you run the command from:
+
+```bash
+cd ~/src/my-repo
+claude-vault revive 47cf1f2e     # revive a specific session here
+claude-vault revive --last       # revive the most recent session
+```
+
+```
+Revived 47cf1f2e-... (86 turns) into /Users/me/.claude/projects/-Users-me-src-my-repo/9f3c1d20-....jsonl
+Resume: claude --resume 9f3c1d20-...
+```
+
+Notes:
+
+- The revived session always gets a **fresh** ID, so it can never overwrite a session Claude Code already has on disk. The original stays in the vault untouched.
+- Tool calls are dropped by default, since the archive stores them without their results. Pass `--include-tools` to keep them as text.
+- Consecutive same-role messages are joined into one turn, so the revived file is a well-formed alternating conversation.
+- Use `--cwd` to file the session under a different directory than the one you are in.
 
 ### list
 

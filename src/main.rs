@@ -1,5 +1,6 @@
 mod db;
 mod import;
+mod revive;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -83,6 +84,24 @@ enum Commands {
         #[arg(short, long, default_value = "markdown")]
         format: ExportFormat,
     },
+    /// Restore a session into ~/.claude/projects/ as a resumable JSONL transcript
+    Revive {
+        /// Session ID or prefix (e.g. "47cf1f2e")
+        #[arg(required_unless_present = "last")]
+        session_id: Option<String>,
+        /// Revive the Nth most recent session (1 = latest, 2 = second latest, ...)
+        #[arg(long, default_missing_value = "1", num_args = 0..=1, value_name = "N")]
+        last: Option<usize>,
+        /// Directory the revived session belongs to (default: current directory)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Path to Claude config directory (default: ~/.claude)
+        #[arg(long)]
+        claude_dir: Option<PathBuf>,
+        /// Keep tool_use lines in the revived transcript (stripped by default)
+        #[arg(long)]
+        include_tools: bool,
+    },
     /// List sessions
     List {
         /// Number of sessions to show (0 = all)
@@ -134,7 +153,7 @@ fn format_project_name(raw: &str) -> String {
 }
 
 /// Remove lines that start with `[tool_use: ` from content.
-fn strip_tool_lines(content: &str) -> String {
+pub(crate) fn strip_tool_lines(content: &str) -> String {
     content
         .lines()
         .filter(|line| !line.starts_with("[tool_use: "))
@@ -346,6 +365,47 @@ async fn run() -> Result<()> {
                     }
                 }
             }
+        }
+        Commands::Revive {
+            session_id,
+            last,
+            cwd,
+            claude_dir,
+            include_tools,
+        } => {
+            let resolved_id = match (session_id, last) {
+                (_, Some(0)) => bail!("--last must be at least 1"),
+                (_, Some(n)) => db::nth_recent_session_id(conn, n.saturating_sub(1)).await?,
+                (Some(prefix), None) => db::resolve_session_id(conn, &prefix).await?,
+                (None, None) => bail!("Specify a session ID or use --last"),
+            };
+            let messages = db::get_session_messages(conn, &resolved_id).await?;
+            if messages.is_empty() {
+                bail!("No messages found for session: {resolved_id}");
+            }
+            let cwd = match cwd {
+                Some(d) => d,
+                None => std::env::current_dir().context("Could not determine current directory")?,
+            };
+            let claude_dir = match claude_dir {
+                Some(d) => d,
+                None => default_claude_dir()?,
+            };
+            let opts = revive::ReviveOptions {
+                cwd: &cwd,
+                claude_dir: &claude_dir,
+                include_tools,
+                git_branch: revive::detect_git_branch(&cwd),
+                version: revive::detect_claude_version(),
+            };
+            let result = revive::revive_session(&messages, &opts)?;
+            println!(
+                "Revived {} ({} turns) into {}",
+                resolved_id,
+                result.message_count,
+                result.path.display()
+            );
+            println!("Resume: claude --resume {}", result.session_id);
         }
         Commands::List {
             limit,
