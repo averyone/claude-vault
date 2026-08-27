@@ -85,6 +85,19 @@ enum Commands {
         format: ExportFormat,
     },
     /// Restore a session into ~/.claude/projects/ as a resumable JSONL transcript
+    ///
+    /// The session is written as a Claude Code transcript under the directory you
+    /// run the command from, so `claude --resume <id>` picks it up like any other
+    /// session. The revived session always gets a fresh ID, so it can never
+    /// overwrite a session Claude Code already has on disk, and the archived copy
+    /// in the vault is left untouched.
+    ///
+    /// Two details follow from how the vault stores messages. Tool calls are
+    /// archived without their results, so they are dropped by default
+    /// (--include-tools keeps them as plain text); and because dropping them
+    /// leaves runs of same-role messages, consecutive same-role messages are
+    /// joined into single turns to keep the transcript a well-formed
+    /// alternating conversation.
     Revive {
         /// Session ID or prefix (e.g. "47cf1f2e")
         #[arg(required_unless_present = "last")]
